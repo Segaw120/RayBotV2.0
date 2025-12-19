@@ -1,0 +1,14 @@
+
+streamlit
+pandas
+numpy
+scikit-learn
+torch
+supabase
+metaapi-cloud-sdk
+python-dotenv
+tqdm
+joblib
+plotly
+matplotlib
+yahooquery
