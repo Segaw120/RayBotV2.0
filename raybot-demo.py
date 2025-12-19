@@ -1,5 +1,6 @@
-# chunk1_l1_inference.py
+# chunk1_l1_infer.py
 import io
+import re
 import logging
 from datetime import datetime, timedelta
 
@@ -16,25 +17,17 @@ try:
 except Exception:
     YahooTicker = None
 
-# Optional: allowlist problematic types for torch.load when necessary
-try:
-    from torch.serialization import add_safe_globals
-    add_safe_globals([np.core.multiarray.scalar, StandardScaler])
-except Exception:
-    # ignore if not available (older torch)
-    pass
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("l1_inference")
 
 st.set_page_config(page_title="Cascade Trader — L1 Inference", layout="wide")
-st.title("Cascade Trader — L1 Inference & Limit Orders (Robust Loader)")
+st.title("Cascade Trader — L1 Inference & Limit Orders (Auto-arch loader)")
 
 # ---------------------------
-# Model architecture (L1)
+# Flexible Level1 model (accepts channels tuple)
 # ---------------------------
 class ConvBlock(nn.Module):
-    def __init__(self, c_in, c_out, k, d, pdrop):
+    def __init__(self, c_in, c_out, k, d, pdrop=0.1):
         super().__init__()
         pad = (k - 1) * d // 2
         self.conv = nn.Conv1d(c_in, c_out, kernel_size=k, dilation=d, padding=pad)
@@ -50,18 +43,25 @@ class ConvBlock(nn.Module):
         return out + x if self.res else out
 
 class Level1ScopeCNN(nn.Module):
-    def __init__(self, in_features=12, channels=(32,64,128)):
+    """
+    Flexible L1 CNN which accepts a channels tuple, kernel_sizes and dilations.
+    channels: tuple of out-channels per block, e.g. (32,64,128)
+    in_features: number of input features (channels) to the first conv
+    """
+    def __init__(self, in_features=12, channels=(32,64,128), kernel_sizes=(5,3,3), dilations=(1,2,4), dropout=0.1):
         super().__init__()
         chs = [in_features] + list(channels)
         blocks = []
-        blocks.append(ConvBlock(chs[0], chs[1], 5, 1, 0.1))
-        blocks.append(ConvBlock(chs[1], chs[2], 3, 2, 0.1))
-        blocks.append(ConvBlock(chs[2], chs[2], 3, 4, 0.1))
+        for i in range(len(channels)):
+            k = kernel_sizes[min(i, len(kernel_sizes)-1)]
+            d = dilations[min(i, len(dilations)-1)]
+            blocks.append(ConvBlock(chs[i], chs[i+1], k=k, d=d, pdrop=dropout))
         self.blocks = nn.Sequential(*blocks)
         self.proj = nn.Conv1d(chs[-1], chs[-1], kernel_size=1)
         self.head = nn.Linear(chs[-1], 1)
     @property
-    def embedding_dim(self): return int(self.blocks[-1].conv.out_channels)
+    def embedding_dim(self):
+        return int(self.blocks[-1].conv.out_channels)
     def forward(self, x):
         z = self.blocks(x)
         z = self.proj(z)
@@ -76,14 +76,14 @@ class TemperatureScaler(nn.Module):
     def forward(self, logits):
         T = torch.exp(self.log_temp)
         return logits / T
-    def load_state(self, state):
+    def load_state(self, st_dict):
         try:
-            self.load_state_dict(state)
+            self.load_state_dict(st_dict)
         except Exception:
-            logger.warning("Temp scaler load failed (state mismatch)")
+            logger.warning("Temp scaler load failed.")
 
 # ---------------------------
-# Feature engineering
+# Feature engineering (same as training)
 # ---------------------------
 def compute_engineered_features(df: pd.DataFrame, windows=(5,10,20)) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
@@ -129,7 +129,7 @@ def to_sequences(features: np.ndarray, indices: np.ndarray, seq_len: int) -> np.
     return X
 
 # ---------------------------
-# Data fetch (gold futures)
+# Gold fetch helper
 # ---------------------------
 def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
     if YahooTicker is None:
@@ -157,39 +157,30 @@ def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
     return raw[required]
 
 # ---------------------------
-# Robust checkpoint extraction
+# Checkpoint robust loader helpers
 # ---------------------------
 def _is_state_dict_like(d: dict) -> bool:
-    # heuristic: contains some typical param names
     if not isinstance(d, dict):
         return False
+    # quick heuristic: contains some tensor-like values or conv/bn names
     keys = list(d.keys())
-    if len(keys) == 0:
-        return False
-    sample_keys = keys[:10]
-    # look for conv/bn/weight substrings
-    for k in sample_keys:
-        if any(sub in k for sub in ("conv.weight","bn.weight","head.weight","proj.weight","blocks.0.conv.weight","blocks")):
+    for k in keys[:20]:
+        if any(sub in k for sub in ("conv.weight","bn.weight","head.weight","proj.weight","blocks.0.conv.weight")):
             return True
-    # also accept if values are tensors/arrays
-    sample_vals = list(d.values())[:5]
-    if all(isinstance(v, (torch.Tensor, np.ndarray)) for v in sample_vals):
+    vals = list(d.values())[:10]
+    if all(isinstance(v, (torch.Tensor, np.ndarray)) for v in vals):
         return True
     return False
 
 def extract_state_dict(container):
-    """Try multiple ways to find the actual state_dict inside the loaded object."""
     if container is None:
         return None, {}
-    # already a state_dict
     if isinstance(container, dict) and _is_state_dict_like(container):
         return container, {}
-    # common wrapper keys
-    for key in ("model_state_dict","state_dict","model","model_state","model_weights","model_state_dict"):
+    for key in ("model_state_dict","state_dict","model","model_state","model_weights"):
         if isinstance(container, dict) and key in container and _is_state_dict_like(container[key]):
             extras = {k:v for k,v in container.items() if k != key}
             return container[key], extras
-    # nested search
     if isinstance(container, dict):
         for k,v in container.items():
             if isinstance(v, dict) and _is_state_dict_like(v):
@@ -206,40 +197,62 @@ def strip_module_prefix(state):
         new[nk] = v
     return new
 
-def find_first_conv_in_features(state):
-    # find a key that endswith conv.weight and take shape[1]
+_conv_key_re = re.compile(r"blocks\.(\d+)\.conv\.weight")
+
+def infer_arch_from_state(state):
+    """
+    Inspect state_dict to infer:
+      - in_features (channels input to first conv)
+      - channels tuple (out-channels for each block)
+    Returns (in_features, channels_list)
+    """
+    blocks = {}
     for k,v in state.items():
-        if "conv.weight" in k and hasattr(v, "shape"):
-            # v is tensor with shape [out, in, k]
-            try:
-                return int(v.shape[1])
-            except Exception:
-                continue
-    # fallback: search for any '.weight' and try to infer
-    for k,v in state.items():
-        if k.endswith(".weight") and hasattr(v, "shape"):
-            # many weights are linear with shape [out,in]
-            return int(v.shape[1]) if len(v.shape) > 1 else int(v.shape[0])
-    return None
+        m = _conv_key_re.search(k)
+        if m and hasattr(v, "shape"):
+            idx = int(m.group(1))
+            out_ch = int(v.shape[0])
+            in_ch = int(v.shape[1])
+            blocks[idx] = (out_ch, in_ch, tuple(v.shape))
+    if not blocks:
+        # fallback: search for any key with '.conv.weight'
+        for k,v in state.items():
+            if ".conv.weight" in k and hasattr(v, "shape"):
+                parts = k.split(".")
+                # try to parse index near 'blocks'
+                try:
+                    idx = int(parts[1]) if parts[0]=='blocks' else None
+                except Exception:
+                    idx = None
+                out_ch = int(v.shape[0]); in_ch = int(v.shape[1])
+                if idx is None:
+                    blocks[0] = (out_ch, in_ch, tuple(v.shape))
+                else:
+                    blocks[idx] = (out_ch, in_ch, tuple(v.shape))
+    if not blocks:
+        return None, None
+    # order by block idx
+    ordered = [blocks[i] for i in sorted(blocks.keys())]
+    channels = [b[0] for b in ordered]
+    in_features = ordered[0][1]  # input channels for first conv
+    return int(in_features), tuple(int(x) for x in channels)
 
 def load_checkpoint_bytes_safe(raw_bytes: bytes):
     """
-    Try torch.load with safe global fixes; return loaded object or raise.
+    Try torch.load with fallbacks; returns loaded object or raises.
     """
     buf = io.BytesIO(raw_bytes)
     try:
         obj = torch.load(buf, map_location="cpu", weights_only=False)
         return obj
     except Exception as e:
-        logger.info("torch.load direct failed, attempting fallback torch.load with weights_only=True: %s", e)
+        logger.info("torch.load direct failed: %s", e)
         buf.seek(0)
         try:
             obj = torch.load(buf, map_location="cpu", weights_only=True)
             return obj
         except Exception as e2:
-            logger.info("weights_only load also failed: %s", e2)
             buf.seek(0)
-            # final fallback: try python pickle load
             import pickle
             try:
                 obj = pickle.loads(buf.read())
@@ -250,10 +263,11 @@ def load_checkpoint_bytes_safe(raw_bytes: bytes):
 
 
 
-# chunk2_l1_inference.py
-# (Continue from chunk 1: run after importing or concatenating both chunks)
 
-# Sidebar config
+# chunk2_l1_infer.py
+# continue running after chunk1
+
+# Sidebar configuration
 st.sidebar.header("Config")
 seq_len = st.sidebar.slider("Sequence length", 8, 256, 64, step=8)
 risk_pct = st.sidebar.slider("Risk per trade (%)", 0.1, 5.0, 2.0) / 100.0
@@ -273,7 +287,7 @@ if "scaler_seq" not in st.session_state:
 if "temp_scaler" not in st.session_state:
     st.session_state.temp_scaler = None
 
-# Fetch gold
+# Fetch Gold data
 if st.button("Fetch latest Gold (GC=F)"):
     try:
         df = fetch_gold_history(days=365, interval="1d")
@@ -285,67 +299,76 @@ if st.button("Fetch latest Gold (GC=F)"):
             st.dataframe(df.tail(10))
     except Exception as e:
         st.error(f"Fetch failed: {e}")
-        st.error(str(e))
 
-# Load checkpoint and extract state dict
+# Load checkpoint and build model to match checkpoint architecture
 if ckpt is not None:
     try:
         raw = ckpt.read()
         loaded = load_checkpoint_bytes_safe(raw)
-        # try to extract state dict and extras
         state_dict, extras = extract_state_dict(loaded)
         if state_dict is None:
-            # maybe the loaded object is a torch.nn.Module saved directly
+            # maybe the file contains a nn.Module object directly
             if isinstance(loaded, nn.Module):
-                # rare case: user saved whole module
                 st.session_state.l1_model = loaded
-                st.success("Loaded L1 as module from checkpoint.")
+                st.success("Loaded L1 as module object from checkpoint.")
             else:
-                raise RuntimeError("Could not find a state_dict inside checkpoint (keys: {}).".format(list(loaded.keys()) if isinstance(loaded, dict) else type(loaded)))
+                st.error("Could not find state_dict inside checkpoint. Try saving state_dict for model only.")
         else:
-            # strip module prefix
+            # remove 'module.' prefix if present
             state_dict = strip_module_prefix(state_dict)
-            in_features = find_first_conv_in_features(state_dict)
-            if in_features is None:
-                st.warning("Could not infer in_features from checkpoint; falling back to 12")
-                in_features = 12
-            model = Level1ScopeCNN(in_features=in_features)
-            # load with strict=False to tolerate missing/unexpected keys; report them
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            inferred_in, inferred_channels = infer_arch_from_state(state_dict)
+            if inferred_in is None or inferred_channels is None:
+                st.warning("Could not infer architecture from checkpoint; falling back to default channels (32,64,128) and in_features=12")
+                inferred_in = inferred_in or 12
+                inferred_channels = inferred_channels or (32,64,128)
+            st.info(f"Inferred in_features={inferred_in}, channels={inferred_channels}")
+            # instantiate model matching inferred channels
+            model = Level1ScopeCNN(in_features=inferred_in, channels=inferred_channels)
+            # load state_dict; prefer strict=True if shapes match exactly, else strict=False
+            # attempt strict=True first to surface errors (so we can fallback)
+            try:
+                missing, unexpected = model.load_state_dict(state_dict, strict=True)
+                st.success("Loaded state_dict with strict=True")
+            except Exception as e_strict:
+                st.warning(f"strict=True failed: {e_strict}. Trying strict=False to load compatible params.")
+                missing, unexpected = model.load_state_dict(state_dict, strict=False)
+                st.success("Loaded state_dict with strict=False (some params may be missing/unexpected)")
+            model.eval()
             st.session_state.l1_model = model
-            st.session_state.scorer_missing = missing
-            st.session_state.scorer_unexpected = unexpected
-            # load scaler if present in extras or loaded dict
-            scaler = None
-            if isinstance(loaded, dict) and "scaler_seq" in loaded:
-                scaler = loaded["scaler_seq"]
-            elif "scaler_seq" in extras:
-                scaler = extras.get("scaler_seq")
-            if scaler is not None:
-                st.session_state.scaler_seq = scaler
-            # load temp scaler if present
-            temp = None
+            # load scaler from extras or loaded dict if present (best-effort)
+            scaler_candidate = None
+            if isinstance(loaded, dict):
+                if "scaler_seq" in loaded:
+                    scaler_candidate = loaded["scaler_seq"]
+                elif "scaler" in loaded:
+                    scaler_candidate = loaded["scaler"]
+                elif "scaler_seq.pkl" in loaded:
+                    scaler_candidate = loaded["scaler_seq.pkl"]
+            if not scaler_candidate and isinstance(extras, dict):
+                scaler_candidate = extras.get("scaler_seq") or extras.get("scaler")
+            if scaler_candidate is not None:
+                st.session_state.scaler_seq = scaler_candidate
+                st.success("Loaded scaler from checkpoint (best-effort)")
+            else:
+                st.warning("No sequence scaler found in checkpoint; a temporary StandardScaler will be fit at inference (not recommended).")
+            # temp scaler
+            temp_state = None
             if isinstance(loaded, dict) and "temp_scaler_state" in loaded:
-                temp = loaded["temp_scaler_state"]
-            elif "temp_scaler_state" in extras:
-                temp = extras.get("temp_scaler_state")
-            if temp is not None:
+                temp_state = loaded["temp_scaler_state"]
+            elif isinstance(extras, dict) and "temp_scaler_state" in extras:
+                temp_state = extras.get("temp_scaler_state")
+            if temp_state is not None:
                 ts = TemperatureScaler()
                 try:
-                    ts.load_state_dict(temp)
+                    ts.load_state_dict(temp_state)
                     st.session_state.temp_scaler = ts
+                    st.success("Loaded temperature scaler state (best-effort)")
                 except Exception:
-                    st.session_state.temp_scaler = None
-            st.success("L1 model loaded (strict=False). Check console for missing/unexpected keys.")
-            if missing:
-                st.warning(f"Missing keys (not loaded): {len(missing)} example: {missing[:5]}")
-            if unexpected:
-                st.info(f"Unexpected keys present in checkpoint but not used by model: {len(unexpected)} example: {unexpected[:5]}")
+                    st.warning("Failed to load temperature scaler state (shape mismatch).")
     except Exception as e:
         st.error(f"Failed to load L1 checkpoint: {e}")
-        st.error(str(e))
 
-# Run inference (single-bar latest)
+# Run inference and propose limit order
 if st.button("Run L1 inference & propose limit order"):
     if st.session_state.market_df is None:
         st.error("No market data. Fetch first.")
@@ -361,23 +384,23 @@ if st.button("Run L1 inference & propose limit order"):
         X_all = feat_seq_df.values.astype('float32')
         scaler = st.session_state.scaler_seq
         if scaler is None:
-            st.warning("No scaler found in checkpoint — fitting a temporary StandardScaler (NOT ideal).")
+            st.warning("No scaler in checkpoint — fitting temporary StandardScaler on the fetched data (this is only a fallback).")
             scaler = StandardScaler().fit(X_all)
         X_scaled = scaler.transform(X_all)
-        # build sequence ending at last bar
-        idx = np.array([len(X_scaled)-1], dtype=int)
-        Xseq = to_sequences(X_scaled, idx, seq_len=seq_len)
+        last_idx = np.array([len(X_scaled)-1], dtype=int)
+        Xseq = to_sequences(X_scaled, last_idx, seq_len=seq_len)
         xb = torch.tensor(Xseq.transpose(0,2,1), dtype=torch.float32)
         model = st.session_state.l1_model
         model.eval()
         with torch.no_grad():
             logit, emb = model(xb)
-            # apply temp scaler if present
+            # apply temp scaler if available
             if st.session_state.temp_scaler is not None:
                 try:
                     logit_np = logit.cpu().numpy().reshape(-1,1)
-                    scaled = st.session_state.temp_scaler.forward(torch.tensor(logit_np)).cpu().numpy().reshape(-1)
-                    prob = 1.0 / (1.0 + np.exp(-scaled))[0]
+                    temp = st.session_state.temp_scaler
+                    scaled = temp(torch.tensor(logit_np)).cpu().numpy().reshape(-1)
+                    prob = float(1.0 / (1.0 + np.exp(-scaled))[0])
                 except Exception:
                     prob = float(torch.sigmoid(logit).cpu().numpy().reshape(-1)[0])
             else:
@@ -395,15 +418,13 @@ if st.button("Run L1 inference & propose limit order"):
         size = risk_amount / stop_distance if stop_distance > 0 else 0.0
         st.subheader("Proposed limit order (LONG)")
         st.json({
-            "entry": entry,
-            "stop_loss": sl,
-            "take_profit": tp,
+            "entry": round(entry, 6),
+            "stop_loss": round(sl, 6),
+            "take_profit": round(tp, 6),
             "atr": float(atr),
             "position_size": float(size),
             "risk_amount_usd": float(risk_amount),
             "probability": float(prob)
         })
 
-# small status info
-st.markdown("---")
-st.caption("Loader notes: this loader will accept nested checkpoint wrappers (model_state_dict, scaler_seq, temp_scaler_state) and will try to load tolerantly. If you still see missing keys, your checkpoint uses a different naming/architecture — share checkpoint structure and I can adapt.")
+st.caption("This loader inspects the checkpoint, infers the L1 channels and input width, builds a matching model, and loads weights. If you still see warnings about missing/unexpected keys, paste `list(loaded.keys())` here and I can adapt further.")
