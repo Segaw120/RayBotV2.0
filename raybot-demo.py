@@ -271,7 +271,7 @@ def load_checkpoint_bytes_safe(raw_bytes: bytes):
 st.sidebar.header("Config")
 seq_len = st.sidebar.slider("Sequence length", 8, 256, 64, step=8)
 risk_pct = st.sidebar.slider("Risk per trade (%)", 0.1, 5.0, 2.0) / 100.0
-tp_mult = st.sidebar.slider("TP ATR multiplier", 1.0, 5.0, 2.0)
+tp_mult = st.sidebar.slider("TP ATR multiplier", 1.0, 5.0, 1.0)
 sl_mult = st.sidebar.slider("SL ATR multiplier", 0.5, 3.0, 1.0)
 account_balance = st.sidebar.number_input("Account balance ($)", value=10000.0)
 
