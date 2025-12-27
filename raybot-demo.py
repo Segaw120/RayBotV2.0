@@ -135,16 +135,20 @@ def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
         raise RuntimeError("yahooquery not installed")
     end = datetime.utcnow()
     start = end - timedelta(days=days)
+    logger.info(f"Fetching data from {start} to {end}")
     tq = YahooTicker("GC=F")
     raw = tq.history(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=interval)
     if raw is None or (isinstance(raw, dict) and not raw):
+        logger.warning("No data returned from Yahoo Finance")
         return pd.DataFrame()
     if isinstance(raw, dict):
         raw = pd.DataFrame(raw)
     if isinstance(raw.index, pd.MultiIndex):
         raw = raw.reset_index(level=0, drop=True)
+    logger.info(f"Raw index type: {type(raw.index)}, timezone: {getattr(raw.index, 'tz', None)}")
     # Ensure all datetime objects are timezone-naive
     raw.index = pd.to_datetime(raw.index).tz_localize(None)
+    logger.info(f"Processed index type: {type(raw.index)}, timezone: {getattr(raw.index, 'tz', None)}")
     raw = raw.sort_index()
     raw.columns = [c.lower() for c in raw.columns]
     if "close" not in raw.columns and "adjclose" in raw.columns:
@@ -154,6 +158,7 @@ def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
     for col in required:
         if col not in raw.columns:
             raw[col] = 0.0
+    logger.info(f"Fetched {len(raw)} records")
     return raw[required]
 
 # ---------------------------
