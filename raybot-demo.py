@@ -143,7 +143,8 @@ def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
         raw = pd.DataFrame(raw)
     if isinstance(raw.index, pd.MultiIndex):
         raw = raw.reset_index(level=0, drop=True)
-    raw.index = pd.to_datetime(raw.index)
+    # Ensure all datetime objects are timezone-naive
+    raw.index = pd.to_datetime(raw.index).tz_localize(None)
     raw = raw.sort_index()
     raw.columns = [c.lower() for c in raw.columns]
     if "close" not in raw.columns and "adjclose" in raw.columns:
@@ -259,7 +260,6 @@ def load_checkpoint_bytes_safe(raw_bytes: bytes):
             except Exception as e3:
                 logger.exception("All checkpoint load attempts failed")
                 raise RuntimeError(f"Failed to load checkpoint: {e3}") from e3
-
 
 # Sidebar configuration
 st.sidebar.header("Config")
