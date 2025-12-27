@@ -138,47 +138,102 @@ def to_sequences(features: np.ndarray, indices: np.ndarray, seq_len: int) -> np.
 # ---------------------------
 # FIXED Gold fetch with yfinance fallback + weekend handling
 # ---------------------------
+# UPDATE ONLY: Replace the fetch_gold_history function in chunk1_l1_infer.py
+
 def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
-    """Robust gold fetch with yfinance fallback and timezone normalization"""
+    """Robust gold fetch with WEEKEND-AWARE logic + yfinance/yahooquery fallback"""
+    
+    def is_weekend():
+        """Detect if current time is weekend (Sat/Sun)"""
+        now = datetime.utcnow()
+        return now.weekday() >= 5  # 5=Sat, 6=Sun
+    
+    def adjust_weekend_period(target_days):
+        """Calculate period to get ~target_days of WEEKDAY data only"""
+        if not is_weekend():
+            return target_days
+        
+        # On weekends: fetch extra days to compensate for missing Sat/Sun
+        weekday_target = target_days * 7 // 5  # ~40% more to get 365 weekdays
+        return max(weekday_target, target_days + 50)  # safety buffer
+    
+    period_days = adjust_weekend_period(days)
+    logger.info(f"Fetching {days} weekdays → using period={period_days}d ({'weekend mode' if is_weekend() else 'weekday mode'})")
     
     # Try yahooquery first
     if YahooTicker is not None:
         try:
             end = datetime.utcnow()
-            start = end - timedelta(days=days)
+            start = end - timedelta(days=period_days)
             tq = YahooTicker("GC=F")
             raw = tq.history(start=start.strftime("%Y-%m-%d"), end=end.strftime("%Y-%m-%d"), interval=interval)
+            
             if raw is not None and not (isinstance(raw, dict) and not raw):
-                if isinstance(raw, dict):
-                    raw = pd.DataFrame(raw)
-                if isinstance(raw.index, pd.MultiIndex):
-                    raw = raw.reset_index(level=0, drop=True)
-                raw.index = pd.to_datetime(raw.index).tz_localize(None)  # FIX: Remove timezone
-                raw = raw.sort_index()
-                raw.columns = [c.lower() for c in raw.columns]
-                if "close" not in raw.columns and "adjclose" in raw.columns:
-                    raw["close"] = raw["adjclose"]
-                raw = raw[~raw.index.duplicated(keep="first")]
-                if len(raw) > 0:
-                    return _normalize_gold_df(raw)
+                df = _process_raw_data(raw)
+                if len(df) >= days * 0.8:  # Good enough
+                    return _filter_weekdays(df, days) if is_weekend() else df
         except Exception as e:
             logger.warning(f"yahooquery failed: {e}")
     
-    # Fallback to yfinance (more reliable on weekends)
+    # Fallback to yfinance (more reliable)
     if YF_AVAILABLE:
         try:
             ticker = yf.Ticker("GC=F")
-            # Use period instead of start/end for weekend robustness
-            period = min(days//30 + 1, 2*days//30)  # 2y max for stability
-            raw = ticker.history(period=f"{period}d", interval=interval, prepost=True)
+            raw = ticker.history(period=f"{period_days}d", interval=interval, prepost=True)
             if not raw.empty:
-                raw.index = pd.to_datetime(raw.index).tz_localize(None)  # FIX: Remove timezone
-                return _normalize_gold_df(raw)
+                df = _process_raw_data(raw)
+                return _filter_weekdays(df, days) if is_weekend() else df
         except Exception as e:
             logger.warning(f"yfinance failed: {e}")
     
-    st.warning("Both yahooquery & yfinance failed. Markets may be closed (weekend). Try weekdays.")
     return pd.DataFrame()
+
+def _process_raw_data(raw) -> pd.DataFrame:
+    """Unified raw data processing with timezone fix"""
+    if isinstance(raw, dict):
+        raw = pd.DataFrame(raw)
+    if isinstance(raw.index, pd.MultiIndex):
+        raw = raw.reset_index(level=0, drop=True)
+    
+    raw.index = pd.to_datetime(raw.index).tz_localize(None)  # CRITICAL FIX
+    raw = raw.sort_index()
+    raw.columns = [c.lower() for c in raw.columns]
+    
+    if "close" not in raw.columns and "adjclose" in raw.columns:
+        raw["close"] = raw["adjclose"]
+    
+    raw = raw[~raw.index.duplicated(keep="first")]
+    return _normalize_gold_df(raw)
+
+def _filter_weekdays(df: pd.DataFrame, min_days: int) -> pd.DataFrame:
+    """Filter to weekdays only + ensure minimum days"""
+    if df.empty:
+        return df
+    
+    # Filter weekdays (Mon-Fri)
+    df_weekdays = df[df.index.weekday < 5].copy()
+    
+    if len(df_weekdays) < min_days * 0.7:
+        st.warning(f"⚠️ Only {len(df_weekdays)} weekdays found (target: {min_days}). Using all available.")
+        return df_weekdays.tail(min_days) if len(df_weekdays) > 0 else df
+    
+    # Take most recent N weekdays
+    return df_weekdays.tail(min_days)
+
+def _normalize_gold_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize OHLCV with safety checks"""
+    required = ['open','high','low','close','volume']
+    for col in required:
+        if col not in df.columns:
+            df[col] = 0.0
+    df = df[required].copy()
+    df.columns = df.columns.str.lower()
+    
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+    
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
 
 def _normalize_gold_df(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize OHLCV dataframe with timezone safety"""
