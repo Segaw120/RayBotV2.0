@@ -134,6 +134,7 @@ def to_sequences(features: np.ndarray, indices: np.ndarray, seq_len: int) -> np.
         X[i] = seq[-seq_len:]
     return X
 
+
 # chunk2_l1_infer.py - COMPLETE FIXED VERSION
 
 # WEEKEND-AWARE Gold fetch (365 weekdays always)
