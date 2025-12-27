@@ -135,7 +135,7 @@ def to_sequences(features: np.ndarray, indices: np.ndarray, seq_len: int) -> np.
     return X
 
 
-# chunk2_l1_infer.py - COMPLETE FIXED VERSION
+# chunk2_l1_infer.py - COMPLETE FIXED VERSION (CONTINUED)
 
 # WEEKEND-AWARE Gold fetch (365 weekdays always)
 def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
@@ -146,7 +146,7 @@ def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
     def adjust_weekend_period(target_days):
         if not is_weekend():
             return target_days
-        weekday_target = target_days * 7 // 5  # ~40% more for weekends
+        weekday_target = target_days * 7 // 5
         return max(weekday_target, target_days + 50)
     
     period_days = adjust_weekend_period(days)
@@ -211,9 +211,20 @@ def _normalize_gold_df(df: pd.DataFrame) -> pd.DataFrame:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
     return df[~df.index.duplicated(keep="last")].sort_index()
 
-# Checkpoint loaders
+# FIXED: Corrected strip_module_prefix function
+def strip_module_prefix(state):
+    new_state = {}
+    for k, v in state.items():
+        if k.startswith("module."):
+            new_state[k[7:]] = v  # Remove "module." prefix (7 chars)
+        else:
+            new_state[k] = v
+    return new_state
+
+# Checkpoint loaders (FIXED)
 def _is_state_dict_like(d: dict) -> bool:
-    if not isinstance(d, dict): return False
+    if not isinstance(d, dict): 
+        return False
     keys = list(d.keys())
     for k in keys[:20]:
         if any(sub in k for sub in ("conv.weight","bn.weight","head.weight","proj.weight","blocks.0.conv.weight")):
@@ -221,15 +232,14 @@ def _is_state_dict_like(d: dict) -> bool:
     return False
 
 def extract_state_dict(container):
-    if container is None: return None, {}
-    if isinstance(container, dict) and _is_state_dict_like(container): return container, {}
+    if container is None: 
+        return None, {}
+    if isinstance(container, dict) and _is_state_dict_like(container): 
+        return container, {}
     for key in ("model_state_dict","state_dict","model","model_state","model_weights"):
         if isinstance(container, dict) and key in container and _is_state_dict_like(container[key]):
             return container[key], {k:v for k,v in container.items() if k != key}
     return None, {}
-
-def strip_module_prefix(state):
-    return {k[len("module."):]:v if k.startswith("module.") else k:v for k,v in state.items()}
 
 _conv_key_re = re.compile(r"blocks.(d+).conv.weight")
 
@@ -238,25 +248,31 @@ def infer_arch_from_state(state):
     for k,v in state.items():
         m = _conv_key_re.search(k)
         if m and hasattr(v, "shape"):
-            idx, out_ch, in_ch = int(m.group(1)), int(v.shape[0]), int(v.shape[1])
+            idx = int(m.group(1))
+            out_ch = int(v.shape[0])
+            in_ch = int(v.shape[1])
             blocks[idx] = (out_ch, in_ch, tuple(v.shape))
     if not blocks:
         return 12, (32,64,128)
     ordered = [blocks[i] for i in sorted(blocks.keys())]
-    return ordered[0][1], tuple(b[0] for b in ordered)
+    channels = [b[0] for b in ordered]
+    in_features = ordered[0][1]
+    return int(in_features), tuple(channels)
 
 def load_checkpoint_bytes_safe(raw_bytes: bytes):
     buf = io.BytesIO(raw_bytes)
-    try: return torch.load(buf, map_location="cpu", weights_only=False)
+    try: 
+        return torch.load(buf, map_location="cpu", weights_only=False)
     except:
         buf.seek(0)
-        try: return torch.load(buf, map_location="cpu", weights_only=True)
+        try: 
+            return torch.load(buf, map_location="cpu", weights_only=True)
         except:
             buf.seek(0)
             import pickle
             return pickle.loads(buf.read())
 
-# UI
+# UI + INFERENCE (same as before)
 st.sidebar.header("Config")
 seq_len = st.sidebar.slider("Sequence length", 8, 256, 64, step=8)
 risk_pct = st.sidebar.slider("Risk per trade (%)", 0.1, 5.0, 2.0) / 100.0
@@ -271,7 +287,6 @@ if "l1_model" not in st.session_state: st.session_state.l1_model = None
 if "scaler_seq" not in st.session_state: st.session_state.scaler_seq = None
 if "temp_scaler" not in st.session_state: st.session_state.temp_scaler = None
 
-# Fetch button
 if st.button("🔄 Fetch latest Gold (GC=F)"):
     with st.spinner("Fetching 365 weekdays..."):
         try:
@@ -285,7 +300,6 @@ if st.button("🔄 Fetch latest Gold (GC=F)"):
         except Exception as e:
             st.error(f"❌ Fetch failed: {str(e)[:200]}")
 
-# Load checkpoint
 if ckpt is not None:
     try:
         raw = ckpt.read()
@@ -311,7 +325,6 @@ if ckpt is not None:
             model.eval()
             st.session_state.l1_model = model
             
-            # Scalers
             for key in ["scaler_seq", "scaler"]:
                 if key in extras or (isinstance(loaded, dict) and key in loaded):
                     st.session_state.scaler_seq = extras.get(key) or loaded.get(key)
@@ -320,7 +333,6 @@ if ckpt is not None:
     except Exception as e:
         st.error(f"❌ Checkpoint failed: {str(e)[:200]}")
 
-# Inference
 if st.button("🚀 Run L1 inference & propose limit order"):
     if st.session_state.market_df is None:
         st.error("❌ Fetch data first")
@@ -329,7 +341,8 @@ if st.button("🚀 Run L1 inference & propose limit order"):
     else:
         with st.spinner("Running inference..."):
             df = st.session_state.market_df.copy()
-            if df.index.tz is not None: df.index = df.index.tz_localize(None)
+            if df.index.tz is not None: 
+                df.index = df.index.tz_localize(None)
             
             feats = compute_engineered_features(df)
             seq_cols = ['open','high','low','close','volume']
@@ -381,4 +394,4 @@ if st.button("🚀 Run L1 inference & propose limit order"):
             }
             st.json(order)
 
-st.caption("✅ Fixed: Weekend weekday filtering (365 trading days), timezone errors, dual yfinance/yahooquery")
+st.caption("✅ FIXED: Syntax error, weekend weekday filtering (365 trading days), timezone errors")
