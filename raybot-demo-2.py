@@ -12,9 +12,9 @@ import torch.nn as nn
 from sklearn.preprocessing import StandardScaler
 
 try:
-    from alpha_vantage.timeseries import TimeSeries
+    from yahooquery import Ticker as YahooTicker
 except Exception:
-    TimeSeries = None
+    YahooTicker = None
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("l1_inference")
@@ -22,9 +22,9 @@ logger = logging.getLogger("l1_inference")
 st.set_page_config(page_title="Cascade Trader — L1 Inference", layout="wide")
 st.title("Cascade Trader — L1 Inference & Limit Orders (Auto-arch loader)")
 
-# ---------------------------  
+# ---------------------------
 # Flexible Level1 model (accepts channels tuple)
-# ---------------------------  
+# ---------------------------
 class ConvBlock(nn.Module):
     def __init__(self, c_in, c_out, k, d, pdrop=0.1):
         super().__init__()
@@ -81,9 +81,9 @@ class TemperatureScaler(nn.Module):
         except Exception:
             logger.warning("Temp scaler load failed.")
 
-# ---------------------------  
+# ---------------------------
 # Feature engineering (same as training)
-# ---------------------------  
+# ---------------------------
 def compute_engineered_features(df: pd.DataFrame, windows=(5,10,20)) -> pd.DataFrame:
     f = pd.DataFrame(index=df.index)
     c = df['close'].astype(float)
@@ -127,80 +127,69 @@ def to_sequences(features: np.ndarray, indices: np.ndarray, seq_len: int) -> np.
         X[i] = seq[-seq_len:]
     return X
 
-# ---------------------------  
-# Gold fetch helper (Alpha Vantage version)
-# ---------------------------  
-@st.cache_data
-def fetch_gold_history(days=365, interval="daily", api_key: str = st.secrets.get("ALPHA_VANTAGE_API_KEY", "")) -> pd.DataFrame:
-    if TimeSeries is None:
-        st.error("alpha-vantage package not installed: pip install alpha-vantage")
-        return pd.DataFrame()
-    if not api_key:
-        st.error("No Alpha Vantage API key found. Add to st.secrets['ALPHA_VANTAGE_API_KEY']")
-        return pd.DataFrame()
-    
-    # Calculate time window (align to ET for daily completion logic)
+# ---------------------------
+# Gold fetch helper
+# ---------------------------
+def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
+    # 1. Calculate time window
     now_utc = datetime.utcnow()
+    # Align to Ethiopian time (UTC+3)
     now_ethiopia = now_utc + timedelta(hours=3)
-    
-    if interval.lower() in ("daily", "d", "1d"):
-        # Use latest *complete* daily date (yesterday in ET)
-        latest_complete_date = now_ethiopia.date() - timedelta(days=1)
-        end_date = datetime.combine(latest_complete_date, datetime.min.time())
-        start_date = end_date - timedelta(days=days + 30)  # Buffer for full coverage
-    else:
-        # For intraday, use recent window
-        end_date = now_utc
-        start_date = end_date - timedelta(days=days)
-    
-    start_str = start_date.strftime("%Y-%m-%d")
-    logger.info(f"Fetching Alpha Vantage data window ending {end_date.date()} ({days} days back)")
-    
-    ts = TimeSeries(key=api_key, output_format='pandas')
-    try:
-        if interval.lower() in ("daily", "d", "1d"):
-            data, meta = ts.get_daily_adjusted(symbol="GC", outputsize='full')
-        else:
-            data, meta = ts.get_intraday(symbol="GC", interval=interval, outputsize='full')
-        
-        data.columns = [c.lower() for c in data.columns]
-        data = data.rename(columns={
-            '1. open': 'open', '2. high': 'high', '3. low': 'low', 
-            '4. close': 'close', '5. volume': 'volume', 
-            '5. adjusted close': 'close'  # prefer adjusted if available
-        })
-        
-        # Parse index, handle tz, shift to ET (+3h)
-        dt_index = pd.to_datetime(data.index)
-        if getattr(dt_index, "tz", None) is not None:
-            dt_index = dt_index.tz_convert("UTC").tz_localize(None)
-        dt_index = dt_index + pd.Timedelta(hours=3)
-        data.index = dt_index
-        
-        # Filter to desired window (ensures latest complete EOD)
-        data = data[(data.index >= pd.Timestamp(start_date)) & (data.index <= pd.Timestamp(end_date))]
-        data = data.sort_index()
-        
-        required = ['open','high','low','close','volume']
-        for col in required:
-            if col not in data.columns:
-                data[col] = 0.0
-        
-        data = data[required][~data.index.duplicated(keep="first")]
-        logger.info(f"Fetched {len(data)} records from Alpha Vantage")
-        return data
-        
-    except Exception as e:
-        logger.error(f"Alpha Vantage fetch failed: {e}")
-        st.error(f"Alpha Vantage API error: {e}")
-        return pd.DataFrame()
 
-# ---------------------------  
-# Checkpoint robust loader helpers (unchanged)
-# ---------------------------  
+    # If daily interval, choose the latest *complete* daily date (use yesterday in ET)
+    if str(interval).lower() in ("1d", "daily", "d"):
+        latest_complete_date = (now_ethiopia.date() - timedelta(days=1))
+        end = datetime.combine(latest_complete_date, datetime.min.time())
+        start = end - timedelta(days=days)
+        start_str = start.strftime("%Y-%m-%d")
+        end_str = end.strftime("%Y-%m-%d")
+    else:
+        # For intraday intervals we keep the original behaviour (use now UTC)
+        end = now_utc
+        start = end - timedelta(days=days)
+        start_str = start.strftime("%Y-%m-%d")
+        end_str = end.strftime("%Y-%m-%d")
+
+    # Safety: ensure start is not after end
+    if start > end:
+        start = end - timedelta(days=days)
+        start_str = start.strftime("%Y-%m-%d")
+
+    # 2. API Call (Yahoo Finance via yahooquery)
+    tq = YahooTicker("GC=F")
+    raw = tq.history(start=start_str,
+                     end=end_str,
+                     interval=interval)
+
+    # 3. Clean and Standardize
+    if isinstance(raw.index, pd.MultiIndex):
+        raw = raw.reset_index(level=0, drop=True)
+
+    # Robustly parse/normalize the index and remove timezones, then convert to ET (+3)
+    dt_index = pd.to_datetime(raw.index)
+    # If tz-aware, convert to UTC naive first
+    if getattr(dt_index, "tz", None) is not None:
+        # convert to UTC then drop tz info
+        try:
+            dt_index = dt_index.tz_convert("UTC").tz_localize(None)
+        except Exception:
+            # If conversion fails, try removing tz directly
+            dt_index = dt_index.tz_localize(None)
+    # Now shift timestamps from UTC to UTC+3 (Ethiopian time alignment)
+    dt_index = dt_index + pd.Timedelta(hours=3)
+    raw.index = dt_index
+
+    raw.columns = [c.lower() for c in raw.columns]         # Normalize casing
+
+    return raw[['open', 'high', 'low', 'close', 'volume']]
+
+# ---------------------------
+# Checkpoint robust loader helpers
+# ---------------------------
 def _is_state_dict_like(d: dict) -> bool:
     if not isinstance(d, dict):
         return False
+    # quick heuristic: contains some tensor-like values or conv/bn names
     keys = list(d.keys())
     for k in keys[:20]:
         if any(sub in k for sub in ("conv.weight","bn.weight","head.weight","proj.weight","blocks.0.conv.weight")):
@@ -231,13 +220,19 @@ def strip_module_prefix(state):
     for k,v in state.items():
         nk = k
         if k.startswith("module."):
-            nk = k[len("module."): ]
+            nk = k[len("module."):]
         new[nk] = v
     return new
 
 _conv_key_re = re.compile(r"blocks\.(\d+)\.conv\.weight")
 
 def infer_arch_from_state(state):
+    """
+    Inspect state_dict to infer:
+      - in_features (channels input to first conv)
+      - channels tuple (out-channels for each block)
+    Returns (in_features, channels_list)
+    """
     blocks = {}
     for k,v in state.items():
         m = _conv_key_re.search(k)
@@ -247,9 +242,11 @@ def infer_arch_from_state(state):
             in_ch = int(v.shape[1])
             blocks[idx] = (out_ch, in_ch, tuple(v.shape))
     if not blocks:
+        # fallback: search for any key with '.conv.weight'
         for k,v in state.items():
             if ".conv.weight" in k and hasattr(v, "shape"):
                 parts = k.split(".")
+                # try to parse index near 'blocks'
                 try:
                     idx = int(parts[1]) if parts[0]=='blocks' else None
                 except Exception:
@@ -261,12 +258,16 @@ def infer_arch_from_state(state):
                     blocks[idx] = (out_ch, in_ch, tuple(v.shape))
     if not blocks:
         return None, None
+    # order by block idx
     ordered = [blocks[i] for i in sorted(blocks.keys())]
     channels = [b[0] for b in ordered]
-    in_features = ordered[0][1]
+    in_features = ordered[0][1]  # input channels for first conv
     return int(in_features), tuple(int(x) for x in channels)
 
 def load_checkpoint_bytes_safe(raw_bytes: bytes):
+    """
+    Try torch.load with fallbacks; returns loaded object or raises.
+    """
     buf = io.BytesIO(raw_bytes)
     try:
         obj = torch.load(buf, map_location="cpu", weights_only=False)
@@ -295,10 +296,6 @@ tp_mult = st.sidebar.slider("TP ATR multiplier", 1.0, 5.0, 1.0)
 sl_mult = st.sidebar.slider("SL ATR multiplier", 0.5, 3.0, 1.0)
 account_balance = st.sidebar.number_input("Account balance ($)", value=10000.0)
 
-api_key_input = st.sidebar.text_input("Alpha Vantage API Key", type="password", help="Or set st.secrets['ALPHA_VANTAGE_API_KEY']")
-if api_key_input:
-    st.session_state.alpha_key = api_key_input
-
 ckpt = st.sidebar.file_uploader("Upload L1 checkpoint (.pt/.pth/.bin)", type=["pt","pth","bin"])
 
 # session state
@@ -311,23 +308,18 @@ if "scaler_seq" not in st.session_state:
 if "temp_scaler" not in st.session_state:
     st.session_state.temp_scaler = None
 
-# Fetch Gold data (Alpha Vantage)
-if st.button("Fetch latest Gold (GC) from Alpha Vantage"):
-    api_key = st.session_state.get("alpha_key") or st.secrets.get("ALPHA_VANTAGE_API_KEY", "")
-    if not api_key:
-        st.error("API key required")
-    else:
-        try:
-            with st.spinner("Fetching from Alpha Vantage..."):
-                df = fetch_gold_history(days=365, interval="daily", api_key=api_key)
-            if df.empty:
-                st.error("No data returned")
-            else:
-                st.session_state.market_df = df
-                st.success(f"Fetched {len(df)} bars")
-                st.dataframe(df.tail(10))
-        except Exception as e:
-            st.error(f"Fetch failed: {e}")
+# Fetch Gold data
+if st.button("Fetch latest Gold (GC=F)"):
+    try:
+        df = fetch_gold_history(days=365, interval="1d")
+        if df.empty:
+            st.error("No data returned")
+        else:
+            st.session_state.market_df = df
+            st.success(f"Fetched {len(df)} bars")
+            st.dataframe(df.tail(10))
+    except Exception as e:
+        st.error(f"Fetch failed: {e}")
 
 # Load checkpoint and build model to match checkpoint architecture
 if ckpt is not None:
@@ -336,12 +328,14 @@ if ckpt is not None:
         loaded = load_checkpoint_bytes_safe(raw)
         state_dict, extras = extract_state_dict(loaded)
         if state_dict is None:
+            # maybe the file contains a nn.Module object directly
             if isinstance(loaded, nn.Module):
                 st.session_state.l1_model = loaded
                 st.success("Loaded L1 as module object from checkpoint.")
             else:
                 st.error("Could not find state_dict inside checkpoint. Try saving state_dict for model only.")
         else:
+            # remove 'module.' prefix if present
             state_dict = strip_module_prefix(state_dict)
             inferred_in, inferred_channels = infer_arch_from_state(state_dict)
             if inferred_in is None or inferred_channels is None:
@@ -349,7 +343,10 @@ if ckpt is not None:
                 inferred_in = inferred_in or 12
                 inferred_channels = inferred_channels or (32,64,128)
             st.info(f"Inferred in_features={inferred_in}, channels={inferred_channels}")
+            # instantiate model matching inferred channels
             model = Level1ScopeCNN(in_features=inferred_in, channels=inferred_channels)
+            # load state_dict; prefer strict=True if shapes match exactly, else strict=False
+            # attempt strict=True first to surface errors (so we can fallback)
             try:
                 missing, unexpected = model.load_state_dict(state_dict, strict=True)
                 st.success("Loaded state_dict with strict=True")
@@ -359,9 +356,15 @@ if ckpt is not None:
                 st.success("Loaded state_dict with strict=False (some params may be missing/unexpected)")
             model.eval()
             st.session_state.l1_model = model
+            # load scaler from extras or loaded dict if present (best-effort)
             scaler_candidate = None
             if isinstance(loaded, dict):
-                scaler_candidate = loaded.get("scaler_seq") or loaded.get("scaler")
+                if "scaler_seq" in loaded:
+                    scaler_candidate = loaded["scaler_seq"]
+                elif "scaler" in loaded:
+                    scaler_candidate = loaded["scaler"]
+                elif "scaler_seq.pkl" in loaded:
+                    scaler_candidate = loaded["scaler_seq.pkl"]
             if not scaler_candidate and isinstance(extras, dict):
                 scaler_candidate = extras.get("scaler_seq") or extras.get("scaler")
             if scaler_candidate is not None:
@@ -369,6 +372,7 @@ if ckpt is not None:
                 st.success("Loaded scaler from checkpoint (best-effort)")
             else:
                 st.warning("No sequence scaler found in checkpoint; a temporary StandardScaler will be fit at inference (not recommended).")
+            # temp scaler
             temp_state = None
             if isinstance(loaded, dict) and "temp_scaler_state" in loaded:
                 temp_state = loaded["temp_scaler_state"]
@@ -411,6 +415,7 @@ if st.button("Run L1 inference & propose limit order"):
         model.eval()
         with torch.no_grad():
             logit, emb = model(xb)
+            # apply temp scaler if available
             if st.session_state.temp_scaler is not None:
                 try:
                     logit_np = logit.cpu().numpy().reshape(-1,1)
@@ -423,10 +428,12 @@ if st.button("Run L1 inference & propose limit order"):
                 prob = float(torch.sigmoid(logit).cpu().numpy().reshape(-1)[0])
         st.subheader("L1 result")
         st.write(f"Probability (buy): {prob:.4f}")
+        # compute ATR and limit order
         atr = feats['atr'].iloc[-1] if 'atr' in feats.columns else (df['high']-df['low']).rolling(14, min_periods=1).mean().iloc[-1]
         entry = float(df['close'].iloc[-1])
         sl = float(entry - atr * sl_mult)
         tp = float(entry + atr * tp_mult)
+        # position sizing
         risk_amount = account_balance * risk_pct
         stop_distance = abs(entry - sl)
         size = risk_amount / stop_distance if stop_distance > 0 else 0.0
@@ -441,4 +448,4 @@ if st.button("Run L1 inference & propose limit order"):
             "probability": float(prob)
         })
 
-st.caption("Updated to use Alpha Vantage with end-of-day completion logic. Set API key in sidebar or st.secrets. Install: pip install alpha-vantage")
+st.caption("This loader inspects the checkpoint, infers the L1 channels and input width, builds a matching model, and loads weights. If you still see warnings about missing/unexpected keys, paste `list(loaded.keys())` here and I can adapt further.")
