@@ -1,7 +1,7 @@
 import io
 import re
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 
 import numpy as np
 import pandas as pd
@@ -128,17 +128,49 @@ def to_sequences(features: np.ndarray, indices: np.ndarray, seq_len: int) -> np.
     return X
 
 # ---------------------------
-# Gold fetch helper
+# Gold fetch helper (UPDATED)
 # ---------------------------
 def fetch_gold_history(days=365, interval="1d") -> pd.DataFrame:
-    # 1. Calculate time window
+    """
+    Fetch GC=F history using yahooquery with a conservative daily-complete-date policy.
+
+    Rules implemented:
+    - Align times to Ethiopian time (UTC+3).
+    - CME daily close (for GC futures) is treated as 01:00 ET (UTC+3).
+    - If current ET time falls in the conservative window (from 15 minutes before close up to 24 hours + 30 minutes after close)
+      we force the latest complete daily date to be "yesterday" (one-day backward delta) to avoid partial/incorrect close values
+      that may appear around the "close update" window in data providers.
+
+    This implements your requirement: from 01:30 ET (close + 30m) to next day 01:30 ET we fetch using a one-day backward delta.
+    Additionally, we start being conservative 15 minutes before close to cover the short window when providers update.
+    """
     now_utc = datetime.utcnow()
     # Align to Ethiopian time (UTC+3)
-    now_ethiopia = now_utc + timedelta(hours=3)
+    now_et = now_utc + timedelta(hours=3)
 
-    # If daily interval, choose the latest *complete* daily date (use yesterday in ET)
+    # Parameters for CME close and buffers (ET)
+    CME_CLOSE_ET = time(1, 0)  # 01:00 ET
+    PRE_CLOSE_BUFFER = timedelta(minutes=15)  # start being conservative 15 minutes before close
+    POST_CLOSE_HOLD = timedelta(minutes=30)   # hold for 30 minutes after close
+
+    # Build reference datetimes for today's close window
+    today_close_dt = datetime.combine(now_et.date(), CME_CLOSE_ET)
+    conservative_start = today_close_dt - PRE_CLOSE_BUFFER            # e.g., 00:45 ET today
+    conservative_hold_start = today_close_dt + POST_CLOSE_HOLD        # e.g., 01:30 ET today
+    conservative_hold_end = conservative_hold_start + timedelta(days=1)  # e.g., 01:30 ET next day
+
+    # Determine whether to force one-day-backward delta for daily completeness
+    force_one_day_delta = False
+    if conservative_start <= now_et < conservative_hold_end:
+        # inside the conservative window that begins 15m before close and extends until next day close+30m
+        force_one_day_delta = True
+
     if str(interval).lower() in ("1d", "daily", "d"):
-        latest_complete_date = (now_ethiopia.date() - timedelta(days=1))
+        if force_one_day_delta:
+            latest_complete_date = (now_et.date() - timedelta(days=1))
+        else:
+            # outside the conservative window — assume today is complete (rare) and use today's date as end
+            latest_complete_date = now_et.date()
         end = datetime.combine(latest_complete_date, datetime.min.time())
         start = end - timedelta(days=days)
         start_str = start.strftime("%Y-%m-%d")
