@@ -60,7 +60,7 @@ Default symbol for gold futures on Yahoo
 
 DEFAULT_SYMBOL = os.getenv("GOLD_SYMBOL", "GC=F")
 
-Exchange timezone for GC futures (CME / New York) — used for some computations
+Exchange timezone for GC futures (CME / New York) - used for some computations
 
 ET_ZONE = tz.gettz("America/New_York") UTC_ZONE = timezone.utc EAT_ZONE = tz.gettz("Africa/Addis_Ababa")
 
@@ -412,7 +412,7 @@ if SUPABASE_URL is None or SUPABASE_KEY is None:
 delete_resp = supabase_delete_existing(symbol_col="symbol", symbol_value=symbol, table=supabase_table)
 insert_resp = supabase_insert_rows(rows, table=supabase_table)
 
-msg = f"Supabase update completed for {symbol} — deleted existing rows; inserted {len(rows)} rows (history + latest)."
+msg = f"Supabase update completed for {symbol} - deleted existing rows; inserted {len(rows)} rows (history + latest)."
 
 # Send Telegram notification if desired
 if notify_telegram:
