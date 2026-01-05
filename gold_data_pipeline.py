@@ -42,7 +42,7 @@ Yahoo-derived daily close is an approximation. For strict CME settlement matchin
 
 from datetime import datetime, timedelta, timezone import os import time import json import math from typing import Optional, Dict, Any, List
 
-import pandas as pd import requests from dateutil import tz
+import pandas as pd import requests try: from dateutil import tz except Exception: tz = None
 
 try: from yahooquery import Ticker except Exception: Ticker = None
 
@@ -62,7 +62,7 @@ DEFAULT_SYMBOL = os.getenv("GOLD_SYMBOL", "GC=F")
 
 Exchange timezone for GC futures (CME / New York) - used for some computations
 
-ET_ZONE = tz.gettz("America/New_York") UTC_ZONE = timezone.utc EAT_ZONE = tz.gettz("Africa/Addis_Ababa")
+if tz is not None: ET_ZONE = tz.gettz("America/New_York") UTC_ZONE = timezone.utc EAT_ZONE = tz.gettz("Africa/Addis_Ababa") else: ET_ZONE = None UTC_ZONE = timezone.utc EAT_ZONE = None
 
 -------------------------------
 
