@@ -50,10 +50,14 @@ from typing import Optional, Dict, Any, List
 import pandas as pd 
 import requests 
 try: 
-   from dateutil import tz except Exception: tz = None
+   from dateutil import tz 
+except Exception: 
+   tz = None
 
 try: 
-   from yahooquery import Ticker except Exception: Ticker = None
+   from yahooquery import Ticker 
+except Exception: 
+   Ticker = None
 
 -------------------------------
 
