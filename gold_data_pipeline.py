@@ -40,11 +40,20 @@ Yahoo-derived daily close is an approximation. For strict CME settlement matchin
 
 """
 
-from datetime import datetime, timedelta, timezone import os import time import json import math from typing import Optional, Dict, Any, List
+from datetime import datetime, timedelta, timezone 
+import os 
+import time 
+import json 
+import math 
+from typing import Optional, Dict, Any, List
 
-import pandas as pd import requests try: from dateutil import tz except Exception: tz = None
+import pandas as pd 
+import requests 
+try: 
+   from dateutil import tz except Exception: tz = None
 
-try: from yahooquery import Ticker except Exception: Ticker = None
+try: 
+   from yahooquery import Ticker except Exception: Ticker = None
 
 -------------------------------
 
