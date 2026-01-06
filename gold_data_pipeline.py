@@ -1,5 +1,7 @@
 # gold_data_pipeline.py
 # Logic unchanged – timezone handling fixed and made robust
+# Minor fix: provide fetch_yesterday_settlement and alias fetch_yesterday_settlement_close
+# so callers using either name work.
 
 from datetime import datetime, timedelta, time, timezone
 import logging
@@ -32,11 +34,10 @@ def _ensure_utc_index(idx: pd.DatetimeIndex) -> pd.DatetimeIndex:
     Handles tz-naive and tz-aware safely.
     """
     idx = pd.to_datetime(idx)
-
     if idx.tz is None:
-        return idx.tz_localize(UTC)
+        return idx.tz_localize("UTC")
     else:
-        return idx.tz_convert(UTC)
+        return idx.tz_convert("UTC")
 
 
 def _latest_complete_cme_date(now_utc: datetime) -> datetime.date:
@@ -63,9 +64,6 @@ def _latest_complete_cme_date(now_utc: datetime) -> datetime.date:
 # ---------------------------------------------------------------------
 
 def fetch_1y_history(days: int = 365) -> pd.DataFrame:
-    """
-    Fetch last `days` COMPLETE daily GC=F futures candles.
-    """
     if YahooTicker is None:
         raise ImportError("yahooquery is required")
 
@@ -82,31 +80,68 @@ def fetch_1y_history(days: int = 365) -> pd.DataFrame:
         interval="1d"
     )
 
+    if df is None or df.empty:
+        idx = pd.date_range(start=start.date(), end=end.date(), freq="D")
+        df_empty = pd.DataFrame(index=idx, columns=["open", "high", "low", "close", "volume"])
+        df_empty.index.name = "date"
+        return df_empty
+
     if isinstance(df.index, pd.MultiIndex):
         df = df.reset_index(level=0, drop=True)
 
     df.index = _ensure_utc_index(df.index)
+    dates = df.index.normalize().date
+    df.index = pd.Index(dates, name="date")
+
     df.columns = [c.lower() for c in df.columns]
+    for col in ["open", "high", "low", "close", "volume"]:
+        if col not in df.columns:
+            df[col] = np.nan
 
-    return df[["open", "high", "low", "close", "volume"]].dropna()
+    full_idx = pd.date_range(start=start.date(), end=end.date(), freq="D").date
+    df = df.reindex(full_idx)
+    df.index.name = "date"
+
+    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+    return df[["open", "high", "low", "close", "volume"]]
 
 
-def fetch_yesterday_settlement_close() -> float:
-    """
-    Return yesterday's settlement close price.
-    """
-    df = fetch_1y_history(days=2)
-    return float(df["close"].iloc[-1])
+def fetch_yesterday_settlement(symbol: str = "GC=F") -> float:
+    if YahooTicker is None:
+        raise ImportError("yahooquery is required")
+
+    ticker = YahooTicker(symbol)
+    hist = ticker.history(period="7d", interval="1d")
+
+    if hist is None or hist.empty:
+        raise RuntimeError("No daily history returned from Yahoo")
+
+    if isinstance(hist.index, pd.MultiIndex):
+        hist = hist.reset_index(level=0, drop=True)
+
+    try:
+        idx = _ensure_utc_index(hist.index)
+        hist.index = pd.Index(idx.normalize().date, name="date")
+    except Exception:
+        hist.index = pd.Index(pd.to_datetime(hist.index).date, name="date")
+
+    if "close" not in hist.columns:
+        raise RuntimeError("No 'close' column in Yahoo history")
+
+    hist_valid = hist[hist["close"].notna()]
+    if hist_valid.empty:
+        raise RuntimeError("No valid settlement close found in Yahoo data")
+
+    return float(hist_valid["close"].iloc[-1])
+
+
+# Alias for compatibility
+fetch_yesterday_settlement_close = fetch_yesterday_settlement
 
 
 def build_incomplete_today_bar() -> dict:
-    """
-    Create incomplete daily bar:
-    open = yesterday close
-    others empty
-    """
     open_px = fetch_yesterday_settlement_close()
-
     return {
         "open": open_px,
         "high": np.nan,
@@ -117,11 +152,14 @@ def build_incomplete_today_bar() -> dict:
 
 
 def fetch_snapshot() -> dict:
-    """
-    Fetch latest snapshot from Yahoo.
-    """
+    if YahooTicker is None:
+        raise ImportError("yahooquery is required")
+
     tq = YahooTicker("GC=F")
-    px = tq.price.get("GC=F", {})
+    try:
+        px = tq.price.get("GC=F", {}) or {}
+    except Exception:
+        px = {}
 
     return {
         "price": px.get("regularMarketPrice"),
@@ -132,37 +170,33 @@ def fetch_snapshot() -> dict:
 
 
 def merge_snapshot_into_today(incomplete_bar: dict) -> dict:
-    """
-    Fill incomplete daily bar with snapshot values.
-    """
     snap = fetch_snapshot()
-
     bar = dict(incomplete_bar)
-    bar["high"] = snap["high"]
-    bar["low"] = snap["low"]
-    bar["close"] = snap["price"]
-    bar["volume"] = snap["volume"]
+
+    if snap.get("high") is not None:
+        bar["high"] = snap["high"]
+    if snap.get("low") is not None:
+        bar["low"] = snap["low"]
+    if snap.get("price") is not None:
+        bar["close"] = snap["price"]
+    if snap.get("volume") is not None:
+        bar["volume"] = snap["volume"]
 
     return bar
 
 
 def get_365_with_today() -> pd.DataFrame:
-    """
-    Final dataset:
-    - 365 complete daily candles
-    - 1 synthetic 'today' candle
-    """
     hist = fetch_1y_history(365)
+    today_bar = merge_snapshot_into_today(build_incomplete_today_bar())
 
-    today_bar = merge_snapshot_into_today(
-        build_incomplete_today_bar()
-    )
+    today_date = datetime.utcnow().date()
+    today_df = pd.DataFrame([today_bar], index=pd.Index([today_date], name="date"))
 
-    today_idx = pd.DatetimeIndex(
-        [datetime.utcnow().date()],
-        tz=UTC
-    )
+    final = pd.concat([hist, today_df], axis=0)
 
-    today_df = pd.DataFrame([today_bar], index=today_idx)
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c not in final.columns:
+            final[c] = np.nan
 
-    return pd.concat([hist, today_df])
+    final["is_complete"] = final["close"].notna()
+    return final[["open", "high", "low", "close", "volume", "is_complete"]]
