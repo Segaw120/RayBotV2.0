@@ -92,16 +92,32 @@ def fetch_1y_history(days: int = 365) -> pd.DataFrame:
     return df[["open", "high", "low", "close", "volume"]].dropna()
 
 
-def fetch_yesterday_settlement_close() -> float:
+def fetch_yesterday_settlement(symbol: str) -> float:
     """
-    Return yesterday's settlement close price.
+    Fetch last available daily settlement close from Yahoo.
+    Falls back gracefully if today's settlement is not yet published.
     """
-    df = fetch_1y_history(days=2)
-    # Guard against empty dataframe to avoid iloc[-1] out-of-bounds
-    if df.empty:
-        raise RuntimeError("No settlement data returned from Yahoo")
-    return float(df["close"].iloc[-1])
+    from yahooquery import Ticker
 
+    ticker = Ticker(symbol)
+    hist = ticker.history(period="7d", interval="1d")
+
+    if hist is None or hist.empty:
+        raise RuntimeError("No daily history returned from Yahoo")
+
+    # Ensure proper sorting
+    hist = hist.sort_index()
+
+    # Drop rows without a close
+    hist = hist[hist["close"].notna()]
+
+    if hist.empty:
+        raise RuntimeError("No valid settlement close found in Yahoo data")
+
+    # ✅ LAST AVAILABLE COMPLETED DAILY CLOSE
+    settlement_close = float(hist.iloc[-1]["close"])
+
+    return settlement_close
 
 def build_incomplete_today_bar() -> dict:
     """
