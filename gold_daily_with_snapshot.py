@@ -1,5 +1,6 @@
 # gold_data_pipeline.py
 # Logic unchanged – timezone handling fixed and made robust
+# Minor fix: guard against empty history when fetching yesterday's settlement close.
 
 from datetime import datetime, timedelta, time, timezone
 import logging
@@ -96,6 +97,9 @@ def fetch_yesterday_settlement_close() -> float:
     Return yesterday's settlement close price.
     """
     df = fetch_1y_history(days=2)
+    # Guard against empty dataframe to avoid iloc[-1] out-of-bounds
+    if df.empty:
+        raise RuntimeError("No settlement data returned from Yahoo")
     return float(df["close"].iloc[-1])
 
 
