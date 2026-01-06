@@ -17,8 +17,8 @@ except Exception:
     YahooTicker = None
 
 # IMPORT FETCHER FROM YOUR MODULE
-# Make sure gold_data_pipeline.py is in the same folder or on PYTHONPATH
-from gold_data_pipeline import fetch_1y_history as fetch_gold_history
+# Make sure gold_daily_with_snapshot.py is in the same folder or on PYTHONPATH
+from gold_daily_with_snapshot import get_365_with_today as fetch_gold_history
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("l1_inference")
@@ -259,7 +259,7 @@ if "temp_scaler" not in st.session_state:
 # Fetch Gold data
 if st.button("Fetch latest Gold (GC=F)"):
     try:
-        df = fetch_gold_history(days=365, interval="1d")
+        df = fetch_gold_history(symbol="GC=F", days=365)
         if df.empty:
             st.error("No data returned")
         else:
