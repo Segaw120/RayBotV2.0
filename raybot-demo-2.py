@@ -274,7 +274,7 @@ if "temp_scaler" not in st.session_state:
 # Fetch Gold data
 if st.button("Fetch latest Gold (GC=F)"):
     try:
-        df = fetch_gold_history(days=365)
+        df = fetch_gold_history()
         if df.empty:
             st.error("No data returned")
         else:
