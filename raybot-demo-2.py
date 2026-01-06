@@ -20,6 +20,21 @@ except Exception:
 # Make sure gold_daily_with_snapshot.py is in the same folder or on PYTHONPATH
 from gold_daily_with_snapshot import get_365_with_today as fetch_gold_history
 
+# Ensure module timezone is not empty (monkeypatch safe fallback)
+# This prevents tz-aware vs tz-naive comparisons inside the module.
+try:
+    import gold_daily_with_snapshot as _gds
+    if getattr(_gds, "ET", None) is None:
+        try:
+            from dateutil import tz as _tz
+            _gds.ET = _tz.gettz("America/New_York")
+        except Exception:
+            from datetime import timezone as _timezone, timedelta as _timedelta
+            _gds.ET = _timezone(_timedelta(hours=-5))
+except Exception:
+    # best-effort only; don't fail import if module not present at this point
+    pass
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("l1_inference")
 
